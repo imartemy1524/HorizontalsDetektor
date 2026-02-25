@@ -1,0 +1,413 @@
+//#pragma enable_d3d11_debug_symbols 
+#pragma kernel createPit
+#pragma kernel createHillok
+#pragma kernel createDitch
+#pragma kernel createRelief
+#pragma kernel noise
+#pragma kernel medium
+#pragma kernel createReliefMap
+#pragma kernel combine
+#pragma kernel convertToImage
+//#pragma kernel medium
+
+struct Vector2 {
+    float x;
+    float y;
+};
+struct Datas {
+    int count;
+    int height;
+    int offset, _g;
+};
+
+RWStructuredBuffer<float> Result;
+RWStructuredBuffer<float> Result2;
+RWStructuredBuffer<float2> gradients;
+float t;
+
+int height, widthHeight, startX, startY, endX, endY, dataW, dataH, parabolCoef, countOfHills;
+float ditchLength, horizontal, elongation, waterHeight;
+ 
+RWStructuredBuffer<Vector2> DataReliefVectors;
+RWStructuredBuffer<Datas> DataRelief;
+int dataReliefCount, reliefStep;
+
+#define CHECK_VALID(x,y) (x >= 0 && y >= 0 && x<dataW && y<dataH)
+#define RESULT(x_,y_) (Result[(y_) * dataW  + (x_)])
+#define RESULT2(x_,y_) (Result2[(y_) * dataW + (x_)])
+#define swap(a,b) a^=b;b^=a;a^=b;
+#define HEIGHT(x) (float(x) / float(height))
+#define OUT_START 1
+#define OUT_END 2
+#define NOT_OUT 0
+int RESULTF(uint x_, uint y_) {
+    int g = int(RESULT(x_, y_) * height / horizontal);
+    return g;
+}
+
+const int distanceSqrBetween(const int x, const int y, const int x1, const int y1) {
+    int deltaX = (x - x1),
+        deltaY = (y - y1);
+    return deltaX * deltaX + deltaY * deltaY;
+}
+float distanceSqrBetweenF(const float x, const float y, const float x1, const float y1) {
+    float deltaX = (x - x1),
+        deltaY = (y - y1);
+    return deltaX * deltaX + deltaY * deltaY;
+}
+
+int outOfDitch(const int x, const int y) {
+    //Вычисляем сколярное произведение векторов (x-startX,y-startY) и (endX-startX,endY-startY)
+    //Если оно >0, => треугольник (x,y) (startX,startY) (endX,endY) тупой, значит обычная формула
+    //иначе ищем расстояние до точки старта
+    const int vectorXS = x - startX, vectorYS = y - startY,
+        vectorXE = endX - startX, vectorYE = endY - startY,
+        vectorXN = endX - x, vectorYN = endY - y;
+    const int vectorMult = vectorXS * vectorXE + vectorYS * vectorYE;
+    if (vectorMult < 0) return OUT_START;
+    const int vectorMult2 = vectorXE * vectorXN + vectorYE * vectorYN;
+    if (vectorMult2 < 0)return OUT_END;
+    return NOT_OUT;
+}
+void generateParabol(const uint3 id : SV_DispatchThreadID,const bool pit) {
+    int distX = id.x - (widthHeight),
+        distY = id.y - (widthHeight),
+        distance_sqr,
+        widthHeightSqr,
+        x = startX + distX,
+        y = startY + distY;
+    //float maxDeph, g;
+    if (CHECK_VALID(x, y)) {
+        //coeffic = Mathf.Sqrt(j1 * j1 + i1 * i1);
+        //float g = def * def / parabolCoefic;
+        distance_sqr = distX * distX + distY * distY;
+        widthHeightSqr = widthHeight * widthHeight;
+        if (distance_sqr <= widthHeightSqr)
+        {
+            //float maxDeph = float(widthHeightSqr) / float(parabolCoef),
+            //    g = float(distance_sqr) / float(parabolCoef);
+            float h =  float(widthHeightSqr - distance_sqr) / parabolCoef;//maxDeph - g;//
+            RESULT(x, y) -= HEIGHT(pit ? h : -h);//getHeight(1.5f - g);
+            //else RESULT(x, y) += HEIGHT(maxDeph - g);
+        }
+    }
+
+}
+float getProectionLength(const uint x,const uint y)
+{
+    //http://www.treugolniki.ru/ploshhad-treugolnika-po-koordinatam-vershin/
+    const int dataS1 = (x - startX) * (endY - startY) - (endX - startX) * (y - startY),
+        Ssquare = abs(dataS1); // abs(dataS1)/2
+    return float(Ssquare) / float(ditchLength);
+}
+
+
+int area(int ax, int ay, int bx, int by, int cx, int cy) {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+bool intersect_1(int a, int b, int c, int d) {
+    if (a > b) swap(a, b);
+    if (c > d) swap(c, d);
+    return max(a, c) <= min(b, d);
+}
+bool intersect(int ax, int ay, int bx, int by, int cx, int cy, int dx, int dy) {
+    return intersect_1(ax, bx, cx, dx)
+        && intersect_1(ay, by, cy, dy)
+        && area(ax, ay, bx, by, cx, cy) * area(ax, ay, bx, by, dx, dy) <= 0
+        && area(cx, cy, dx, dy, ax, ay) * area(cx, cy, dx, dy, bx, by) <= 0;
+}
+bool canBeSecondHeight(int minHeightIndexRelief, int currentX, int currentY, Vector2 newPoint) {
+    const Datas minRelief = DataRelief[minHeightIndexRelief];
+    for (int i = minRelief.offset+1;i < minRelief.offset + minRelief.count;i++) {
+        Vector2 el = DataReliefVectors[i];
+        Vector2 el2 = DataReliefVectors[i-1];
+        if (intersect(newPoint.x, newPoint.y, currentX, currentY, el.x, el.y, el2.x, el2.y)) return false;
+    }
+    return true;
+}
+
+
+[numthreads(1, 1, 1)]
+void createRelief(uint3 id : sv_dispatchthreadid) {
+    float minSizeA = 0xffffffff, minSizeB = 0xffffffff;
+    uint minHeight, minHeight2, minHeightIndexRelief;
+    for (uint i = 0, startoffset = 0; i < dataReliefCount; i++) {
+        const Datas relel = DataRelief[i];
+        float minH = 0xffffffff, minHIndex;
+        for (uint j = 0;j < relel.count;j++) {
+            const Vector2 el = DataReliefVectors[j + relel.offset];
+            float lengthSqr = distanceSqrBetweenF(el.x, el.y, float(id.x), float(id.y));
+            if (lengthSqr < minH) {
+                minH = lengthSqr;
+                minHIndex = j + relel.offset;
+            }
+        }
+        if (minH < minSizeA) {
+            minSizeA = minH;
+            minHeight = uint(relel.height);
+            minHeightIndexRelief = i;
+        }
+        else if (minH < minSizeB && canBeSecondHeight(minHeightIndexRelief, id.x, id.y, DataReliefVectors[minHIndex]) ) {
+            minSizeB = minH;
+            minHeight2 = uint(relel.height);
+        }
+    }
+    if (minSizeB == 0xffffffff) RESULT(id.x, id.y) += HEIGHT(minHeight);
+    else {
+        float la = sqrt(float(minSizeA)), lb = sqrt(float(minSizeB));
+        float ans = (la / (la + lb)) * float(minHeight2 - minHeight) + minHeight;
+        RESULT(id.x, id.y) += HEIGHT(ans);
+    }
+}
+
+
+
+float dropOff(float x)
+{
+    float v = 1 - abs(x);
+    //return 3 * v * v - 2 * v * v * v; // weird normals
+    return 6 * pow(v, 5) - 15 * pow(v, 4) + 10 * pow(v, 3); // nice normals
+}
+float2 grad(uint2 u)
+{
+    return gradients[(u.x + u.y * 16) % 256];
+}
+float noiseSE(float2 g, float2 v)
+{
+    return dot(g, v.xy) * dropOff(v.x) * dropOff(v.y);
+}
+float noises(float4 v)
+{
+    v += float4(t, 0.0, t, 0.0);
+    uint4 gi = floor(v.xyxy) + uint4(0, 0, 1, 1);
+    v = frac(v.xyxy) - float4(0.0, 0.0, 1.0, 1.0);
+
+    return noiseSE(grad(gi.xy), v.xy) +
+    	   noiseSE(grad(gi.zy), v.zy) + 
+           noiseSE(grad(gi.xw), v.xw) +
+           noiseSE(grad(gi.zw), v.zw);
+}
+#define NOISE_STEP(i) h += (1.0 + noises(xyxy * pow(2.0f, i) / res)) * pow(2.0f, -(i + 2));
+[numthreads(1, 1, 1)]
+void noise(uint3 x : sv_dispatchthreadid)
+{
+	float4 xyxy = float4(x.xyxy) * elongation;
+    float res = float(dataW > dataH ? dataW : dataH);
+    //float4 v = xyxy / res;
+
+    float h = 0.0f;//BE CAREFUL: loops doesn't work on android for some reason :(
+
+    // for (int i = 0; i < countOfHills; i++)
+    // {
+    //     
+    //     h += (1.0 + noises(xyxy * pow(2.0f, i) / res)) * pow(2.0f, -(i + 2));
+    // }
+    NOISE_STEP(0);
+    if (countOfHills > 1)NOISE_STEP(1.f);
+    if (countOfHills > 2)NOISE_STEP(2.f);
+    if (countOfHills > 3)NOISE_STEP(3.f);
+    if (countOfHills > 4)NOISE_STEP(4.f);
+    if (countOfHills > 5)NOISE_STEP(5.f);
+    if (countOfHills > 6)NOISE_STEP(6.f);
+    if (countOfHills > 7)NOISE_STEP(7.f);
+    if (countOfHills > 8)NOISE_STEP(8.f);
+	RESULT(x.x, x.y) = fmod((h - .5f) / 1.5f + .5f, 1.f);
+}
+
+[numthreads(1, 1, 1)]
+void medium(uint3 id : sv_dispatchthreadid) {
+    if (id.x <= 1 || id.x >= dataW - 2) RESULT2(id.x, id.y) = RESULT(id.x, id.y);
+    else {
+        const uint x = id.x;
+        const uint y = id.y;
+        const float sum = 7.4f;
+        /*const float3x3 matrix_ = {
+            0,0,0,
+            0, 1.f, 0,
+            0,0,0
+        };*/
+        float ans = float(
+            //1. * RESULT(x, y - 1) +
+            1. * RESULT(x - 1, y) +
+            3. * RESULT(x, y) +   
+            1. * RESULT(x + 1, y) +
+            1.2 * RESULT(x + 2, y) + 
+            1.2 * RESULT(x - 2, y)//+
+            //1. * RESULT(x, y + 1) //+ 
+            //1. * RESULT(x+1, y + 1) +
+            //1. * RESULT(x-1, y + 1) +
+            //1. * RESULT(x-1, y -1) +
+            //1. * RESULT(x+1, y -1)
+            ) / sum;
+        //ans = RESULT(x, y);
+        RESULT2(id.x, id.y) = ans;
+    }
+}
+
+[numthreads(2, 2, 1)]
+void createPit(uint3 id : SV_DispatchThreadID)
+{
+    generateParabol(id, true);
+}
+[numthreads(2, 2, 1)]
+void createHillok(uint3 id : SV_DispatchThreadID)
+{
+    generateParabol(id, false);
+}
+[numthreads(1, 1, 1)]
+void createDitch(uint3 id : SV_DispatchThreadID) {
+    int x = startX + id.x - widthHeight,
+        y = startY + (startY < endY ? id.y - widthHeight : -int(id.y) + widthHeight);
+    if (CHECK_VALID(x, y)) {
+        int ditch = outOfDitch(x, y);
+        switch (ditch) {
+        case OUT_START:
+            int distance_sqr = distanceSqrBetween(x, y, startX, startY);
+            float h = float(widthHeight * widthHeight - distance_sqr) / parabolCoef;//maxDeph - g;//
+            if (h > 0) RESULT(x, y) -= HEIGHT(h);
+            break;
+        case OUT_END:
+            int distance_sqr1 = distanceSqrBetween(x, y, endX, endY);
+            float h1 = float(widthHeight * widthHeight - distance_sqr1) / parabolCoef;//maxDeph - g;//
+            if (h1 > 0)RESULT(x, y) -= HEIGHT(h1);
+            break;
+        case NOT_OUT:
+            float distance = getProectionLength(x, y);
+            if (distance <= widthHeight)
+                RESULT(x, y) -= HEIGHT(float(widthHeight * widthHeight - distance * distance) / float(parabolCoef));
+            break;
+        }
+    }
+}
+
+RWTexture2D<float4> ImageResult;
+Texture2D<float4> ImageResult2;
+Texture2D<float4> ImageResult1;
+float4 colorGood, colorWater, colorGoodFill;
+float heightFill;
+
+float isHorizontal(uint3 id: SV_DispatchThreadID, int maxX, int maxY) {
+    const float coef = 0.5f;
+    float c = 0;
+    const int num = RESULTF(id.x, id.y);
+    if (id.x > 0 && RESULTF(id.x - 1, id.y) != num ) c+=coef; 
+    if (id.y > 0 && RESULTF(id.x, id.y - 1) != num) c+=coef;
+    if (id.x < maxX - 1 && RESULTF(id.x + 1, id.y) != num) c+=coef;
+    if (id.y < maxY - 1 && RESULTF(id.x, id.y + 1) != num) c+=coef;
+    if(c>0.5f)return min(c,1.0f);
+    if(num % 5 == 0)
+    {
+        if(c==.5f)return 1.f;
+	     if (id.x > 1 && RESULTF(id.x - 2, id.y) > num ) c+=coef;
+    	 if (id.y > 1 && RESULTF(id.x, id.y - 2) > num) c+=coef;
+    	 if (id.x < maxX - 2 && RESULTF(id.x + 2, id.y) > num) c+=coef;
+		 if (id.y < maxY - 2 && RESULTF(id.x, id.y + 2) > num) c+=coef;
+    }
+    else if(num%5==1)
+    {
+        if(c==.5f)return 1.f;
+	     if (id.x > 1 && RESULTF(id.x - 2, id.y) < num )c+=coef;
+    	 if (id.y > 1 && RESULTF(id.x, id.y - 2) < num)c+=coef;
+    	 if (id.x < maxX - 2 && RESULTF(id.x + 2, id.y) < num) c+=coef;
+		 if (id.y < maxY - 2 && RESULTF(id.x, id.y + 2) < num) c+=coef;
+
+    }
+    return min(c,0.5f);
+}
+bool isWaterBorder(uint3 id : SV_DispatchThreadID, int maxX, int maxY)
+{
+	if (id.x <= 0 || id.x >= maxX - 1 || id.y <= 0 || id.y >= maxY - 1)
+		return false;
+
+	if (RESULT(id.x - 1, id.y) > waterHeight) return true;
+	if (RESULT(id.x, id.y - 1) > waterHeight) return true;
+	if (RESULT(id.x + 1, id.y) > waterHeight) return true;
+	if ( RESULT(id.x, id.y + 1) > waterHeight) return true; 
+	return false;
+}
+
+[numthreads(1, 1, 1)]
+void createReliefMap(uint3 id : SV_DispatchThreadID) {
+//uint pos = asuint(id.y * dataW + id.x);
+//ImageResult[id.xy] = colorGood;
+	if (RESULT(id.x, id.y) <= waterHeight)
+	{
+		if (isWaterBorder(id, dataW, dataH)) ImageResult[id.xy] = float4(0, 0, 0, 1);
+		else ImageResult[id.xy] = colorWater;
+	}
+	else {
+        float g = isHorizontal(id, dataW, dataH);
+		if (g!=0) ImageResult[id.xy] = float4(colorGood.r, colorGood.g, colorGood.b, g);
+		else ImageResult[id.xy] = float4(0, 0, 0, 0);
+	}
+}
+[numthreads(1, 1, 1)]
+void combine(uint3 id : SV_DispatchThreadID)
+{
+    //ImageResult[id.xy] = float4(ImageResult[id.xy].r, ImageResult[id.xy].g, ImageResult[id.xy].b, ImageResult[id.xy].a); //float4(0, 0, 0, 1);
+    float4 first = ImageResult1[(id.xy)],
+	second = ImageResult2[id.xy];
+     if (second.a != 0){
+		if(second.a == 1) ImageResult[id.xy] = second;
+        else
+        {
+            const float alpha = second.a;
+            ImageResult[id.xy] = float4(
+				second.r * alpha + (1-alpha) * first.r,
+				second.g * alpha + (1-alpha) * first.g,
+				second.b * alpha + (1-alpha) * first.b,
+				1
+			);
+        }
+
+     }
+    else ImageResult[id.xy] = first;
+    
+} 
+
+[numthreads(1, 1, 1)]
+void convertToImage(uint3 id : SV_DispatchThreadID)
+{
+    if (RESULT(id.x, id.y) < heightFill)
+        ImageResult[id.xy] = colorGoodFill;
+
+}
+//[numthreads(1,1,1)]
+//void createRelief(uint3 id : SV_DispatchThreadID) {
+//    float minSizeA = 0xFFFFFFFF,
+//        minSizeB = 0xFFFFFFFF;
+//    uint heightA=1U,
+//        heightB=1U;
+//    for (uint i = 0, startOffset = 0;i < dataReliefCount;i++) {
+//        const Datas relEl = DataRelief[i];
+//        float minH = 0xFFFFFFFF;
+//        for (uint j = 0;j < relEl.count;j++) {
+//            const Vector2 el = DataReliefVectors[j + startOffset];
+//            float lengthSqr = distanceSqrBetweenF(el.x, el.y, float(id.x), float(id.y));
+//            if (lengthSqr < minH)minH = lengthSqr;
+//        }
+//        if (minH < minSizeA) {
+//            minSizeB = minSizeA;
+//            heightB = heightA;
+//            minSizeA = minH;
+//            heightA = uint(relEl.height);
+//        }
+//        else if (minH < minSizeB) {
+//            minSizeB = minH;
+//            heightB = uint(relEl.height);
+//        }
+//        startOffset += relEl.count;
+//    }
+//    float La = sqrt(float(minSizeA)), Lb = sqrt(float(minSizeB));
+//    float h;
+//    if (heightA == heightB) {
+//        h = heightA; // + (heightA - heightB) * Lb / (Lb + La);
+//    }
+//    else if (heightA < heightB) {
+//        h = heightA;
+//    }
+//    else {
+//        h = heightB;
+//    }
+//    RESULT(id.x, id.y) += HEIGHT(h);
+//} 
