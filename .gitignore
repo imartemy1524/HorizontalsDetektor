@@ -17,3 +17,5 @@ HeightmapModel/dataset/
 HeightmapModel/runs/*/epoch_*.pt
 HeightmapModel/runs/*/latest.pt
 HeightmapModel/runs/*/tb_logs/
+dataset/
+.idea/
