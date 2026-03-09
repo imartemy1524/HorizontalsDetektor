@@ -3,3 +3,17 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+.idea/
+
+# Datasets and images
+*.jpg
+*.png
+*.data
+DatasetGeneratorRust/dataset/
+DatasetGeneratorRust/target/
+HeightmapModel/dataset/
+
+# Training runs — ignore everything except best models
+HeightmapModel/runs/*/epoch_*.pt
+HeightmapModel/runs/*/latest.pt
+HeightmapModel/runs/*/tb_logs/
